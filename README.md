@@ -12,12 +12,16 @@ nano .env # complete with correct information
 cp filemon.logrotate /etc/logrotate.d/filemon
 cp filemon.service /etc/systemd/system/
 
+mkdir /var/lib/filemon
+
 # Install pip and venv 
 sudo apt install python3-pip python3-venv -y
 python3 -m venv venv
 chmod 600 /opt/filemon/checkedfile.conf
 
-systemctl daemon-reload
-systemctl enable filemon
-systemctl start filemon
+sudo systemctl daemon-reload
+sudo systemctl enable filemon
+sudo systemctl stop filemon
+sudo systemctl start filemon
 
+sudo systemctl status filemon

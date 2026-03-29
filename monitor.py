@@ -1,42 +1,37 @@
 import time
-import hashlib
-import json
 import os
 import fnmatch
+import json
+import hashlib
 import logging
 import requests
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+import socket
 from dotenv import load_dotenv
 
-# ===================== PATH =====================
+# ===================== CONFIG =====================
 BASE_DIR = "/opt/filemon"
 CONFIG_FILE = f"{BASE_DIR}/checkedfile.conf"
 HASH_DB = "/var/lib/filemon/file_hash.json"
 LOG_FILE = "/var/log/filemon.log"
 ENV_FILE = f"{BASE_DIR}/.env"
 
-# ===================== LOAD ENV =====================
+SCAN_INTERVAL = 60  # detik
+
 load_dotenv(ENV_FILE)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# ===================== ENV =====================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-WHATSAPP_API_URL = os.getenv("WHATSAPP_API_URL")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-WHATSAPP_NUMBER = os.getenv("WHATSAPP_NUMBER")
+WHATSAPP_API_URL = os.getenv("WHATSAPP_API_URL", "").strip()
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
+WHATSAPP_NUMBER = os.getenv("WHATSAPP_NUMBER", "").strip()
+WHATSAPP_DEVICE_KEY = os.getenv("WHATSAPP_DEVICE_KEY", "device-1").strip()
 
 NOTIF_CHANNEL = os.getenv("NOTIF_CHANNEL", "telegram").lower()
+HOST_ALIAS = os.getenv("HOST_ALIAS") or socket.gethostname()
 
-# ===================== GLOBAL =====================
-patterns = []
-exclude_dirs = []
-critical_files = []
-watch_dirs = []
-file_hashes = {}
-last_mtime = 0
-
-# ===================== LOGGING =====================
+# ===================== LOG =====================
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
@@ -54,29 +49,28 @@ def send_telegram(message):
         return
 
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message
-        }, timeout=5)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=5
+        )
     except Exception as e:
         log(f"[ERROR] Telegram failed: {e}")
 
 # ===================== WHATSAPP =====================
 def send_whatsapp(message):
-    if not WHATSAPP_API_URL or not WHATSAPP_TOKEN:
+    if not WHATSAPP_API_URL or not WHATSAPP_TOKEN or not WHATSAPP_NUMBER:
         log("[WARNING] WhatsApp not configured")
         return
 
     try:
         headers = {
             "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-            "Accept": "application/json",
             "Content-Type": "application/json"
         }
 
         payload = {
-            "device_key": os.getenv("WHATSAPP_DEVICE_KEY", "device-1"),
+            "device_key": WHATSAPP_DEVICE_KEY,
             "to": WHATSAPP_NUMBER,
             "message": message
         }
@@ -88,14 +82,19 @@ def send_whatsapp(message):
             timeout=10
         )
 
-        if response.status_code != 200:
-            log(f"[ERROR] WhatsApp API {response.status_code}: {response.text}")
+        log(f"[DEBUG] WA Status: {response.status_code}")
+        log(f"[DEBUG] WA Response: {response.text}")
 
     except Exception as e:
         log(f"[ERROR] WhatsApp failed: {e}")
 
 # ===================== DISPATCH =====================
-def send_notif(message):
+def send_batch(events):
+    if not events:
+        return
+
+    message = f"🚨 {HOST_ALIAS}\n\n" + "\n\n".join(events)
+
     if NOTIF_CHANNEL == "telegram":
         send_telegram(message)
 
@@ -109,14 +108,28 @@ def send_notif(message):
     else:
         log(f"[WARNING] Unknown NOTIF_CHANNEL: {NOTIF_CHANNEL}")
 
-# ===================== CONFIG =====================
-def load_config():
-    global patterns, exclude_dirs, critical_files, watch_dirs
+# ===================== FORMAT =====================
+def format_event(event_type, path):
+    if event_type == "CHANGE":
+        return f"⚠️ CHANGE\n📄 {path}"
 
-    patterns = []
-    exclude_dirs = []
-    critical_files = []
-    watch_dirs = []
+    elif event_type == "DELETE":
+        return f"❌ DELETE\n📄 {path}"
+
+    elif event_type == "CRITICAL":
+        return f"🔥 CRITICAL\n📄 {path}"
+
+    return f"{event_type}\n{path}"
+
+# ===================== CONFIG =====================
+patterns = []
+watch_dirs = []
+exclude_dirs = []
+critical_files = []
+
+def load_config():
+    global patterns, watch_dirs, exclude_dirs, critical_files
+    patterns, watch_dirs, exclude_dirs, critical_files = [], [], [], []
 
     with open(CONFIG_FILE) as f:
         for line in f:
@@ -125,38 +138,19 @@ def load_config():
             if not line or line.startswith("#"):
                 continue
 
-            if line.startswith("!"):
+            if line.startswith("@watch:"):
+                watch_dirs.append(line.split(":",1)[1])
+
+            elif line.startswith("!"):
                 exclude_dirs.append(line[1:])
 
             elif line.startswith("@critical:"):
                 critical_files.append(line.split(":",1)[1])
 
-            elif line.startswith("@watch:"):
-                watch_dirs.append(line.split(":",1)[1])
-
             else:
                 patterns.append(line)
 
-def reload_config_if_needed():
-    global last_mtime
-    mtime = os.path.getmtime(CONFIG_FILE)
-
-    if mtime != last_mtime:
-        log("[INFO] Reload config")
-        load_config()
-        last_mtime = mtime
-
 # ===================== HASH =====================
-def load_hash():
-    global file_hashes
-    if os.path.exists(HASH_DB):
-        with open(HASH_DB, "r") as f:
-            file_hashes = json.load(f)
-
-def save_hash():
-    with open(HASH_DB, "w") as f:
-        json.dump(file_hashes, f, indent=2)
-
 def get_hash(path):
     try:
         with open(path, "rb") as f:
@@ -164,96 +158,102 @@ def get_hash(path):
     except:
         return None
 
+def get_info(path):
+    try:
+        stat = os.stat(path)
+        return {
+            "mtime": stat.st_mtime,
+            "size": stat.st_size,
+            "hash": get_hash(path)
+        }
+    except:
+        return None
+
+# ===================== DB =====================
+def load_db():
+    if os.path.exists(HASH_DB):
+        with open(HASH_DB) as f:
+            return json.load(f)
+    return {}
+
+def save_db(db):
+    try:
+        with open(HASH_DB, "w") as f:
+            json.dump(db, f, indent=2)
+    except Exception as e:
+        log(f"[ERROR] save_db failed: {e}")
+
 # ===================== FILTER =====================
 def is_excluded(path):
-    for d in exclude_dirs:
-        if d in path:
-            return True
-    return False
+    return any(d in path for d in exclude_dirs)
 
-def is_monitored(path):
-    for p in patterns:
-        if fnmatch.fnmatch(path, p):
-            return True
-    return False
+def is_match(path):
+    return any(fnmatch.fnmatch(path, p) for p in patterns)
 
 def is_critical(path):
-    for c in critical_files:
-        if path.endswith(c):
-            return True
-    return False
+    return any(path.endswith(c) for c in critical_files)
 
-# ===================== HANDLER =====================
-class MonitorHandler(FileSystemEventHandler):
+# ===================== SCAN =====================
+def scan(db):
+    current_files = {}
+    events = []
 
-    def process(self, path, event_type):
-        if not os.path.isfile(path):
-            return
+    for base in watch_dirs:
+        for root, dirs, files in os.walk(base):
+            if is_excluded(root):
+                continue
 
-        if is_excluded(path):
-            return
+            for f in files:
+                full = os.path.join(root, f)
 
-        if not is_monitored(path):
-            return
+                if not is_match(full):
+                    continue
 
-        new_hash = get_hash(path)
-        old_hash = file_hashes.get(path)
+                info = get_info(full)
+                if not info:
+                    continue
 
-        if event_type == "deleted":
-            msg = f"[DELETE] {path}"
-            log(msg)
-            send_notif(msg)
-            file_hashes.pop(path, None)
+                current_files[full] = info
 
-        elif old_hash != new_hash:
-            if is_critical(path):
-                msg = f"[CRITICAL] {path}"
-            else:
-                msg = f"[CHANGE] {path}"
+                old = db.get(full)
 
-            log(msg)
-            send_notif(msg)
-            file_hashes[path] = new_hash
+                if old != info:
+                    if is_critical(full):
+                        events.append(format_event("CRITICAL", full))
+                    else:
+                        events.append(format_event("CHANGE", full))
 
-        save_hash()
+    # DELETE detection
+    for path in list(db.keys()):
+        if path not in current_files:
+            events.append(format_event("DELETE", path))
 
-    def on_modified(self, event):
-        self.process(event.src_path, "modified")
-
-    def on_created(self, event):
-        self.process(event.src_path, "created")
-
-    def on_deleted(self, event):
-        self.process(event.src_path, "deleted")
-
-# ===================== OBSERVER =====================
-def start_observer():
-    observer = Observer()
-
-    for path in watch_dirs:
-        if os.path.exists(path):
-            observer.schedule(MonitorHandler(), path, recursive=True)
-            log(f"[WATCHING] {path}")
-        else:
-            log(f"[WARNING] Path not found: {path}")
-
-    observer.start()
-    return observer
+    return current_files, events
 
 # ===================== MAIN =====================
 if __name__ == "__main__":
-    log("[START] File Monitor running")
+    log("[START] File monitor (polling mode)")
 
     load_config()
-    load_hash()
 
-    observer = start_observer()
+    # pastikan directory ada
+    os.makedirs(os.path.dirname(HASH_DB), exist_ok=True)
 
-    try:
-        while True:
-            reload_config_if_needed()
-            time.sleep(5)
-    except KeyboardInterrupt:
-        observer.stop()
+    db = load_db()
 
-    observer.join()
+    while True:
+        try:
+            new_db, events = scan(db)
+
+            if events:
+                send_batch(events)
+
+            db = new_db
+            save_db(db)
+
+        except Exception as e:
+            log(f"[ERROR] {e}")
+
+        time.sleep(SCAN_INTERVAL)
+        
+        
