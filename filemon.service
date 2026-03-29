@@ -1,0 +1,12 @@
+[Unit]
+Description=File Monitor + Telegram/Whatsapp Alert
+After=network.target
+
+[Service]
+ExecStart=/opt/filemon/venv/bin/python3 /opt/filemon/monitor.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+/var/log/filemon.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+}
